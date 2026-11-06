@@ -1,0 +1,49 @@
+name: Build ARM64 Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 当推送 v1.0 之类的 tag 时触发
+  workflow_dispatch: # 也可以手动触发
+
+jobs:
+  build-arm64:
+    # 关键：使用 ARM64 的运行器
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write # 需要写入权限来创建 Release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          # 安装 Tauri 在 Linux 上所需的系统依赖，注意 WebKitGTK 版本
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu # 明确指定目标架构
+
+      - name: Install frontend dependencies
+        run: npm install # 或者 pnpm install / yarn install
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # 如果项目不在根目录，需要指定 projectPath
+          # projectPath: './src-tauri'
+          args: --target aarch64-unknown-linux-gnu
