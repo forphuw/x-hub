@@ -1,52 +1,119 @@
 name: Build ARM64 Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - 'v*' # 当推送 v1.0 之类的 tag 时触发
-  workflow_dispatch: # 也可以手动触发
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
-  build-arm64:
-    # 关键：使用 ARM64 的运行器
+  release:
+    # GitHub 官方 ARM64 托管 runner，原生 aarch64，无需交叉编译
     runs-on: ubuntu-22.04-arm
-    permissions:
-      contents: write # 需要写入权限来创建 Release
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 完整历史 + tags：release 正文优先取 RELEASE_NOTES.md 对应段落，
+          # 段落缺失时回退读 tag annotation
+          fetch-depth: 0
 
-      - name: Install Linux dependencies
+      - name: Install system dependencies
+        # 关键：libpipewire-0.3-dev + libspa-0.2-dev + clang + libclang-dev
+        # 是 x-hub 依赖链（libspa-sys）编译的硬性要求，缺一不可
         run: |
           sudo apt-get update
-          # 安装 Tauri 在 Linux 上所需的系统依赖，注意 WebKitGTK 版本
-          sudo apt-get install -y libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
-            clang
+            clang \
+            libclang-dev \
+            pkg-config \
+            build-essential \
+            libssl-dev \
+            file
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          # 24 起才能原生加载 .ts（gen-settings-index.mjs import guideToc.ts，与前端共用分章口径，
+          # Node 20 报 ERR_UNKNOWN_FILE_EXTENSION）；与 ci.yml / 本机开发环境对齐
+          node-version: 24
+          cache: npm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu # 明确指定目标架构
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        run: npm install # 或者 pnpm install / yarn install
+        run: npm ci
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build release bundles
+        # 生成 deb + AppImage；Kylin 上 deb 用 dpkg -i 安装，AppImage 免安装直接运行
+        run: npm run tauri:build -- --bundles deb,appimage
+
+      - name: Collect artifacts
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          deb_src=$(ls src-tauri/target/release/bundle/deb/*.deb 2>/dev/null | head -1 || true)
+          appimage_src=$(ls src-tauri/target/release/bundle/appimage/*.AppImage 2>/dev/null | head -1 || true)
+
+          if [ -z "${deb_src:-}" ]; then echo "::error::未找到 deb 产物"; exit 1; fi
+          if [ -z "${appimage_src:-}" ]; then echo "::error::未找到 AppImage 产物"; exit 1; fi
+
+          # 统一命名为 x-hub-<ver>-linux-arm64.{deb,AppImage}
+          deb_out="x-hub-${version}-linux-arm64.deb"
+          appimage_out="x-hub-${version}-linux-arm64.AppImage"
+          cp "$deb_src" "$deb_out"
+          cp "$appimage_src" "$appimage_out"
+          chmod +x "$appimage_out"
+
+          echo "deb_name=$deb_out" >> "$GITHUB_OUTPUT"
+          echo "appimage_name=$appimage_out" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from RELEASE_NOTES.md
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          # 等价于原 PowerShell 逻辑：从「# vX.Y.Z 发布说明」到下一个一级标题
+          awk -v ver="$version" '
+            BEGIN { found = 0 }
+            $0 ~ "^# v"ver"([ \t]|$)" { found = 1; next }
+            found && $0 ~ "^# " { exit }
+            found { print }
+          ' RELEASE_NOTES.md > release_notes.md
+
+          if [ ! -s release_notes.md ]; then
+            echo "::warning::RELEASE_NOTES.md 未找到 v${version} 段落，回退为 tag annotation"
+            git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > release_notes.md
+          fi
+          echo "release notes 行数: $(wc -l < release_notes.md)"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
         with:
-          # 如果项目不在根目录，需要指定 projectPath
-          # projectPath: './src-tauri'
-          args: --target aarch64-unknown-linux-gnu
+          tag_name: ${{ github.ref_name }}
+          # ⚠️ 参数名是 `name`，不是 `release_name`
+          name: 'x-hub ${{ github.ref_name }}'
+          body_path: release_notes.md
+          files: |
+            ${{ steps.package.outputs.deb_name }}
+            ${{ steps.package.outputs.appimage_name }}
+          draft: true
+          prerelease: false
